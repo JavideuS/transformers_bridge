@@ -1,0 +1,6 @@
+typeguard
+torch
+torchvision
+transformers[torch]
+pillow
+#numpy==1.26.4
