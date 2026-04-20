@@ -10,6 +10,7 @@ import rclpy
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn, State
 from rclpy.callback_groups import ReentrantCallbackGroup
 from sensor_msgs.msg import Image
+from vision_msgs.msg import Detection2DArray, Detection2D, BoundingBox2D, ObjectHypothesisWithPose
 from cv_bridge import CvBridge
 
 
@@ -31,9 +32,10 @@ class TransformersDetectorNode(LifecycleNode):
         self._model = None
         self._processor = None
         self._bridge = CvBridge()
+        self._image_size = None
 
         # Pub/Sub
-        self._pub_img = None
+        self._pub_detections = None
         self._pub_debug = None
         self._sub = None
 
@@ -58,6 +60,8 @@ class TransformersDetectorNode(LifecycleNode):
         else:
             self._device = torch.device(device_param)
 
+        self._image_size   = self.get_parameter("image_size").value
+
         self._input_topic  = self.get_parameter("input_topic").value
         self._output_topic = self.get_parameter("output_topic").value
         self._debug_topic  = self.get_parameter("debug_topic").value
@@ -78,8 +82,8 @@ class TransformersDetectorNode(LifecycleNode):
 
     def on_activate(self, state: State) -> TransitionCallbackReturn:
         """Start inference thread, create publishers and subscription."""
-        self._pub_img = self.create_lifecycle_publisher(
-            Image, self._output_topic, 10)
+        self._pub_detections = self.create_lifecycle_publisher(
+            Detection2DArray, self._output_topic, 10)
 
         if self.debug:
             self._pub_debug = self.create_lifecycle_publisher(
@@ -116,8 +120,8 @@ class TransformersDetectorNode(LifecycleNode):
         self._latest_frame = None
         self._new_frame_event.clear()
 
-        self.destroy_lifecycle_publisher(self._pub_img)
-        self._pub_img = None
+        self.destroy_lifecycle_publisher(self._pub_detections)
+        self._pub_detections = None
 
         if self._pub_debug is not None:
             self.destroy_lifecycle_publisher(self._pub_debug)
@@ -131,6 +135,7 @@ class TransformersDetectorNode(LifecycleNode):
         del self._model, self._processor
         torch.cuda.empty_cache()
         self._model = self._processor = None
+        self._image_size = None
         self.get_logger().info("Model unloaded, GPU memory freed")
         return TransitionCallbackReturn.SUCCESS
 
@@ -157,7 +162,7 @@ class TransformersDetectorNode(LifecycleNode):
         """Run a few dummy forward passes so CUDA JIT kernels are compiled
         before the first real frame arrives. Must mirror _infer_and_publish exactly."""
         self.get_logger().info("Running warm-up …")
-        dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+        dummy = np.zeros((self._image_size, self._image_size, 3), dtype=np.uint8)
         inputs = self._processor(images=dummy, return_tensors="pt").to(self._device)
         with torch.inference_mode():
             for _ in range(runs):
@@ -193,7 +198,7 @@ class TransformersDetectorNode(LifecycleNode):
         cv_image = self._bridge.imgmsg_to_cv2(frame, "rgb8")
 
         inputs = self._processor(
-            images=cv_image, return_tensors="pt").to(self._device)
+            images=cv_image, return_tensors="pt", size={"height": self._image_size, "width": self._image_size}).to(self._device)
 
         with torch.inference_mode():
             outputs = self._forward(inputs)
@@ -205,11 +210,13 @@ class TransformersDetectorNode(LifecycleNode):
             threshold=self.threshold,
         )[0]
 
-        for score, label_id, box in zip(
-                results["scores"], results["labels"], results["boxes"]):
-            self.get_logger().info(
-                f"  {self._model.config.id2label[label_id.item()]}: "
-                f"{score.item():.2f}  box={[round(v,1) for v in box.tolist()]}")
+        # Avoid publishing empty detections
+        if len(results["scores"]) == 0:
+            return
+
+        self._pub_detections.publish(self._to_detection_msg(results, frame.header))
+
+        self.get_logger().debug(f"scores: {results['scores']}, labels: {results['labels']}, boxes: {results['boxes']}")
 
         # Debug annotation — zero cost when debug=False
         if self.debug:
@@ -218,8 +225,32 @@ class TransformersDetectorNode(LifecycleNode):
             debug_msg.header = frame.header
             self._pub_debug.publish(debug_msg)
 
-        # Re-publish original frame
-        self._pub_img.publish(frame)
+    # ── Vision Msgs ───────────────────────────────────────────────────────────
+    def _to_detection_msg(self, results, header) -> Detection2DArray:
+        array_msg = Detection2DArray()
+        array_msg.header = header
+
+        for score, label_id, box in zip(
+                results["scores"], results["labels"], results["boxes"]):
+            det = Detection2D()
+            det.header = header
+
+            # Bounding box center + size (Detection2D uses center format, not x1y1x2y2)
+            x1, y1, x2, y2 = box.tolist()
+            det.bbox.center.position.x = (x1 + x2) / 2
+            det.bbox.center.position.y = (y1 + y2) / 2
+            det.bbox.size_x = float(x2 - x1)
+            det.bbox.size_y = float(y2 - y1)
+
+            # Class + confidence
+            hyp = ObjectHypothesisWithPose()
+            hyp.hypothesis.class_id = self._model.config.id2label[label_id.item()]
+            hyp.hypothesis.score = score.item()
+            det.results.append(hyp)
+
+            array_msg.detections.append(det)
+
+        return array_msg
 
     def _draw(self, img: np.ndarray, result) -> np.ndarray:
         """Draw bounding boxes onto img (RGB). Returns the annotated image."""
