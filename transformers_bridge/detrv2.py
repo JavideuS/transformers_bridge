@@ -7,15 +7,19 @@ import torch
 import cv2
 import numpy as np
 import threading
+import time
 from transformers import AutoImageProcessor, AutoModelForObjectDetection
 
 # ROS imports
 import rclpy
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn, State
 from rclpy.callback_groups import ReentrantCallbackGroup
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CompressedImage
 from vision_msgs.msg import Detection2DArray, Detection2D, BoundingBox2D, ObjectHypothesisWithPose
 from cv_bridge import CvBridge
+#Optimization
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+
 
 
 class TransformersDetectorNode(LifecycleNode):
@@ -28,6 +32,7 @@ class TransformersDetectorNode(LifecycleNode):
         self.declare_parameter("debug", False)  # toggle bounding-box annotation
         self.declare_parameter("device",     "auto")  # auto/cpu/cuda
         self.declare_parameter("image_size", 640)     # resize before inference
+        self.declare_parameter("compressed", False)   # subscribe to compressed image topics
 
         # Model (loaded in on_configure)
         self._model = None
@@ -40,6 +45,13 @@ class TransformersDetectorNode(LifecycleNode):
         self._pub_debug = None
         self._sub = None
 
+
+        self._camera_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT, # avoids reliable/best_effor compatibility issues
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1  # only keep latest — Matches drop policy
+        )
+
         # Inference thread state
         # _latest_frame: written atomically by _image_callback (CPython GIL),
         # pinned to a local variable before use in _infer_loop.
@@ -47,6 +59,10 @@ class TransformersDetectorNode(LifecycleNode):
         self._new_frame_event = threading.Event()   # signals a new frame is ready
         self._running = False
         self._infer_thread: threading.Thread | None = None
+
+        # FPS counting
+        self._frame_count = 0
+        self._fps_last_time = None
 
     # ── Lifecycle callbacks ─────────────────────────────────────────────────
 
@@ -62,6 +78,7 @@ class TransformersDetectorNode(LifecycleNode):
             self._device = torch.device(device_param)
 
         self._image_size = self.get_parameter("image_size").value
+        self.compressed  = self.get_parameter("compressed").value
 
         self.get_logger().info(
             f"Loading model '{self.model_name}' on {self._device} …")
@@ -88,9 +105,14 @@ class TransformersDetectorNode(LifecycleNode):
                 Image, "debug_image", 10)
 
         # Subscription just stores the frame and wakes the inference thread
-        self._sub = self.create_subscription(
-            Image, "/camera/image_raw", self._image_callback, 10,
-            callback_group=self._callback_group)
+        if self.compressed:
+            self._sub = self.create_subscription(
+                CompressedImage, "/camera/image_raw/compressed", self._image_callback, self._camera_qos,
+                callback_group=self._callback_group)
+        else:
+            self._sub = self.create_subscription(
+                Image, "/camera/image_raw", self._image_callback, self._camera_qos,
+                callback_group=self._callback_group)
 
         # Inference thread: runs at maximum speed, blocked by Event when idle
         self._running = True
@@ -167,7 +189,7 @@ class TransformersDetectorNode(LifecycleNode):
                 self._forward(inputs)
         self.get_logger().info("Warm-up complete ✓")
     
-    def _image_callback(self, msg: Image) -> None:
+    def _image_callback(self, msg) -> None:
         """Store the latest frame and wake the inference thread. Must stay fast."""
         self._latest_frame = msg    # atomic in CPython (single STORE_ATTR)
         self._new_frame_event.set() # unblock _infer_loop
@@ -193,7 +215,20 @@ class TransformersDetectorNode(LifecycleNode):
             self._infer_and_publish(frame)
 
     def _infer_and_publish(self, frame: Image) -> None:
-        cv_image = self._bridge.imgmsg_to_cv2(frame, "rgb8")
+        now = time.monotonic()
+        if self._fps_last_time is not None:
+            self._frame_count += 1
+            if self._frame_count % 30 == 0:
+                fps = 30 / (now - self._fps_last_time)
+                self.get_logger().info(f"Inference FPS: {fps:.1f}")
+                self._fps_last_time = now
+        else:
+            self._fps_last_time = now
+
+        if isinstance(frame, CompressedImage):
+            cv_image = self._bridge.compressed_imgmsg_to_cv2(frame, "rgb8")
+        else:
+            cv_image = self._bridge.imgmsg_to_cv2(frame, "rgb8")
 
         inputs = self._processor(
             images=cv_image, return_tensors="pt", size={"height": self._image_size, "width": self._image_size}).to(self._device)

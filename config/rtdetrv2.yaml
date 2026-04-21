@@ -8,7 +8,9 @@
 /transformers/transformers_node:
   ros__parameters:
     model_name: "PekingU/rtdetr_v2_r18vd"
-    threshold:  0.5
-    debug:      false
-    device:     "auto"   # auto | cpu | cuda
-    image_size: 640      # resize shorter edge before inference (RT-DETR specific)
+    threshold: 0.5
+    debug: false
+    compressed: false
+    compile: true
+    device: "auto" # auto | cpu | cuda
+    image_size: 640 # resize shorter edge before inference (RT-DETR specific)

@@ -16,6 +16,10 @@ setup(
         # Parameter files
         ('share/' + package_name + '/config',
             ['config/rtdetrv2.yaml']),
+
+        # Install media files next to scripts so nodes can find them at runtime
+        ('lib/' + package_name, ['madison.jpg']),
+        ('lib/' + package_name, ['SukunaJogo_h264.mp4']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
