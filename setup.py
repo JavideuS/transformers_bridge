@@ -10,6 +10,12 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        # Launch files
+        ('share/' + package_name + '/launch',
+            ['launch/default.launch.py', 'launch/fast.launch.py']),
+        # Parameter files
+        ('share/' + package_name + '/config',
+            ['config/rtdetrv2.yaml']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -26,6 +32,7 @@ setup(
         'console_scripts': [
             'detrv2 = transformers_bridge.detrv2:main',
             'test_image_pub = transformers_bridge.test_image_publisher:main',
+            'venv_setup = scripts.venv_setup:main',
         ],
     },
 )

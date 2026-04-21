@@ -1,3 +1,7 @@
+from scripts.venv_setup import auto_inject_venv
+auto_inject_venv(packages=['torch', 'transformers'])
+# Now safe to import ML packages
+
 # ML imports
 import torch
 import cv2
@@ -22,11 +26,8 @@ class TransformersDetectorNode(LifecycleNode):
         self.declare_parameter("model_name", "PekingU/rtdetr_v2_r18vd")
         self.declare_parameter("threshold", 0.5)
         self.declare_parameter("debug", False)  # toggle bounding-box annotation
-        self.declare_parameter("input_topic",  "/camera/image_raw")
-        self.declare_parameter("output_topic", "/detections")
-        self.declare_parameter("debug_topic",  "/detections/debug_image")
-        self.declare_parameter("device",       "auto")   # auto/cpu/cuda
-        self.declare_parameter("image_size",   640)       # RT-DETR specific
+        self.declare_parameter("device",     "auto")  # auto/cpu/cuda
+        self.declare_parameter("image_size", 640)     # resize before inference
 
         # Model (loaded in on_configure)
         self._model = None
@@ -60,11 +61,7 @@ class TransformersDetectorNode(LifecycleNode):
         else:
             self._device = torch.device(device_param)
 
-        self._image_size   = self.get_parameter("image_size").value
-
-        self._input_topic  = self.get_parameter("input_topic").value
-        self._output_topic = self.get_parameter("output_topic").value
-        self._debug_topic  = self.get_parameter("debug_topic").value
+        self._image_size = self.get_parameter("image_size").value
 
         self.get_logger().info(
             f"Loading model '{self.model_name}' on {self._device} …")
@@ -82,16 +79,17 @@ class TransformersDetectorNode(LifecycleNode):
 
     def on_activate(self, state: State) -> TransitionCallbackReturn:
         """Start inference thread, create publishers and subscription."""
+        # Relative names — remappable via --ros-args --remap or launch remappings=[]
         self._pub_detections = self.create_lifecycle_publisher(
-            Detection2DArray, self._output_topic, 10)
+            Detection2DArray, "detections", 10)
 
         if self.debug:
             self._pub_debug = self.create_lifecycle_publisher(
-                Image, self._debug_topic, 10)
+                Image, "debug_image", 10)
 
         # Subscription just stores the frame and wakes the inference thread
         self._sub = self.create_subscription(
-            Image, self._input_topic, self._image_callback, 10,
+            Image, "/camera/image_raw", self._image_callback, 10,
             callback_group=self._callback_group)
 
         # Inference thread: runs at maximum speed, blocked by Event when idle
@@ -101,7 +99,7 @@ class TransformersDetectorNode(LifecycleNode):
         self._infer_thread.start()
 
         self.get_logger().info(
-            f"Active — inference at max speed on /camera/image_raw  (debug={self.debug})")
+            f"Active — inference at max speed  (debug={self.debug})")
 
         # Required: activates all lifecycle publishers managed by the base class
         return super().on_activate(state)

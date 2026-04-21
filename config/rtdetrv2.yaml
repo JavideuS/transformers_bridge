@@ -1,0 +1,14 @@
+# Parameters for the RTDETRv2 detector node.
+# Loaded by both default.launch.py and fast.launch.py.
+#
+# Key: fully-qualified node name (namespace + node name).
+# Override at launch time with:
+#   ros2 launch transformers_bridge fast.launch.py threshold:=0.7
+
+/transformers/transformers_node:
+  ros__parameters:
+    model_name: "PekingU/rtdetr_v2_r18vd"
+    threshold:  0.5
+    debug:      false
+    device:     "auto"   # auto | cpu | cuda
+    image_size: 640      # resize shorter edge before inference (RT-DETR specific)
