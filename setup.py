@@ -37,6 +37,7 @@ setup(
             'detrv2 = transformers_bridge.detrv2:main',
             'test_image_pub = transformers_bridge.test_image_publisher:main',
             'venv_setup = scripts.venv_setup:main',
+            'list_models = transformers_bridge.model_registry:main',
         ],
     },
 )

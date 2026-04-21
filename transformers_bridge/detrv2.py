@@ -9,6 +9,7 @@ import numpy as np
 import threading
 import time
 from transformers import AutoImageProcessor, AutoModelForObjectDetection
+from transformers_bridge.model_registry import resolve_model_config
 
 # ROS imports
 import rclpy
@@ -80,11 +81,44 @@ class TransformersDetectorNode(LifecycleNode):
         self._image_size = self.get_parameter("image_size").value
         self.compressed  = self.get_parameter("compressed").value
 
-        self.get_logger().info(
-            f"Loading model '{self.model_name}' on {self._device} …")
+        # Resolve model config from registry
+        # This allows us to use custom model names and automatically get the correct processor and model classes
+        cfg, matched_key = resolve_model_config(self.model_name)
 
-        self._processor = AutoImageProcessor.from_pretrained(self.model_name)
-        self._model     = AutoModelForObjectDetection.from_pretrained(self.model_name)
+        if matched_key is None:
+            self.get_logger().warn(
+                f"Model '{self.model_name}' did not match any registry entry — "
+                f"falling back to Auto classes. Results may vary."
+            )
+        elif not cfg.get("tested", False):
+            self.get_logger().warn(
+                f"Model type '{matched_key}' is in the registry but has not been "
+                f"tested end-to-end. Proceed with caution."
+            )
+
+        if cfg.get("notes"):
+            self.get_logger().info(f"Registry note for '{matched_key}': {cfg['notes']}")
+
+        for param in cfg.get("extra_params", []):
+            try:
+                self.declare_parameter(param, "")
+            except Exception:
+                pass  # already declared
+
+        processor_cls = cfg["processor_cls"]
+        model_cls = cfg["model_cls"]
+
+        self.get_logger().info(
+            f"Loading model '{self.model_name}' on {self._device} "
+            f"[{processor_cls.__name__} / {model_cls.__name__}] …"
+        )
+
+        try:
+            self._processor = processor_cls.from_pretrained(self.model_name)
+            self._model = model_cls.from_pretrained(self.model_name)
+        except Exception as e:
+            self.get_logger().error(f"Failed to load model '{self.model_name}': {e}")
+            return TransitionCallbackReturn.FAILURE
         self._model.to(self._device).eval()
 
         self._callback_group = ReentrantCallbackGroup()
@@ -222,6 +256,7 @@ class TransformersDetectorNode(LifecycleNode):
                 fps = 30 / (now - self._fps_last_time)
                 self.get_logger().info(f"Inference FPS: {fps:.1f}")
                 self._fps_last_time = now
+                self._frame_count = 0
         else:
             self._fps_last_time = now
 

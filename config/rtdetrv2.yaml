@@ -11,6 +11,5 @@
     threshold: 0.5
     debug: false
     compressed: false
-    compile: true
     device: "auto" # auto | cpu | cuda
     image_size: 640 # resize shorter edge before inference (RT-DETR specific)

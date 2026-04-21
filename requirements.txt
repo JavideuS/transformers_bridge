@@ -1,6 +1,5 @@
-typeguard
-torch
-torchvision
-transformers[torch]
-pillow
+torch>=2.0.0
+torchvision>=0.15.0
+transformers[torch]>=4.40.0
+pillow>=9.0.0
 #numpy==1.26.4

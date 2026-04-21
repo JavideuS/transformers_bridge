@@ -3,7 +3,7 @@
 <package format="3">
   <name>transformers_bridge</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>ROS 2 bridge connecting HuggingFace Transformers to the ROS 2 perception stack</description>
   <maintainer email="javi.rm2005@gmail.com">javideus</maintainer>
   <license>Apache-2.0</license>
 
