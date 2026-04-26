@@ -48,16 +48,52 @@ _FALLBACK: dict = {
 }
 
 
+import os
+import json
+from pathlib import Path
+
 def resolve_model_config(model_name: str) -> tuple[dict, str | None]:
     """Return (config, matched_key).
 
     Iterates registry keys and returns the first whose key is a substring of
-    model_name.lower(). Returns (fallback_config, None) when nothing matches.
+    model_name.lower(). 
+    
+    If model_name is a directory, it checks config.json for the architecture
+    before falling back.
     """
     lower = model_name.lower()
+    
+    # 1. Standard substring match
     for key, cfg in REGISTRY.items():
         if key in lower:
             return cfg, key
+            
+    # 2. Local directory check
+    model_path = Path(model_name)
+    if model_path.is_dir():
+        config_file = model_path / "config.json"
+        if config_file.exists():
+            try:
+                with open(config_file, 'r') as f:
+                    config_data = json.load(f)
+                
+                # Check architectures field
+                architectures = config_data.get("architectures", [])
+                for arch in architectures:
+                    arch_lower = arch.lower()
+                    for key, cfg in REGISTRY.items():
+                        if key in arch_lower:
+                            return cfg, key
+                            
+                # Check model_type field as fallback
+                model_type = config_data.get("model_type", "").lower()
+                if model_type:
+                    for key, cfg in REGISTRY.items():
+                        if key in model_type:
+                            return cfg, key
+            except Exception:
+                pass # Fallback to default if anything goes wrong
+                
     return _FALLBACK, None
 
 

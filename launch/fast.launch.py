@@ -20,9 +20,9 @@ from launch.actions import (
     TimerAction,
     DeclareLaunchArgument,
     SetEnvironmentVariable,
+    OpaqueFunction,
 )
-from launch.events import matches_action
-from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import LifecycleNode
 from launch_ros.event_handlers import OnStateTransition
 from launch_ros.events.lifecycle import ChangeState
@@ -30,35 +30,35 @@ from lifecycle_msgs.msg import Transition
 from ament_index_python.packages import get_package_share_directory
 from launch.event_handlers import OnProcessStart
 
+def launch_setup(context, *args, **kwargs):
+    debug_val = LaunchConfiguration('debug').perform(context).lower()
+    params_file = LaunchConfiguration('params_file').perform(context)
 
-def generate_launch_description():
-    params = os.path.join(
-        get_package_share_directory('transformers_bridge'),
-        'config', 'rtdetrv2.yaml')
+    # Base parameters from YAML
+    node_params = [params_file]
 
-    debug_arg = DeclareLaunchArgument(
-        'debug',
-        default_value='False',
-        description='Enable debug image publishing'
-    )
-    debug_eval = PythonExpression(["'", LaunchConfiguration('debug'), "'.lower() == 'true'"])
+    # Only override debug if explicitly set to true or false
+    if debug_val == 'true':
+        node_params.append({'debug': True})
+    elif debug_val == 'false':
+        node_params.append({'debug': False})
+    # If 'none' (default), we don't append anything, so the YAML value wins.
 
-    # 1. The main node in lifecycle unconfigured state
+    # 1. The main node
     node = LifecycleNode(
         package='transformers_bridge',
         namespace='transformers',
-        executable='detrv2',
+        executable='detector',
         name='transformers_node',
         output='both',
         emulate_tty=True,
-        parameters=[params, {'debug': debug_eval}],
+        parameters=node_params,
         remappings=[
-            ('/camera/image_raw', '/camera/image_raw'),
+            ('/camera/image_raw', '/camera2/left/image_raw'),
         ],
     )
 
-    # Small delay (0.5 s) lets the node finish __init__ and register its
-    # lifecycle interface before we send the first transition request.
+    # Lifecycle events
     configure_event = EmitEvent(
         event=ChangeState(
             lifecycle_node_matcher=launch.events.matchers.matches_action(node),
@@ -73,7 +73,6 @@ def generate_launch_description():
         )
     )
 
-    # Activate as soon as configure succeeds (→ inactive state)
     activate_event = EmitEvent(
         event=ChangeState(
             lifecycle_node_matcher=launch.events.matchers.matches_action(node),
@@ -89,4 +88,28 @@ def generate_launch_description():
         )
     )
 
-    return LaunchDescription([debug_arg, node, on_process_start, on_inactive])
+    return [node, on_process_start, on_inactive]
+
+
+def generate_launch_description():
+    params_path = os.path.join(
+        get_package_share_directory('transformers_bridge'),
+        'config', 'default.yaml')
+
+    params_file_arg = DeclareLaunchArgument(
+        'params_file',
+        default_value=params_path,
+        description='Path to the ROS 2 parameters file to use'
+    )
+
+    debug_arg = DeclareLaunchArgument(
+        'debug',
+        default_value='none',
+        description='Override debug parameter (true/false). If "none", uses value from params_file.'
+    )
+
+    return LaunchDescription([
+        params_file_arg,
+        debug_arg,
+        OpaqueFunction(function=launch_setup)
+    ])

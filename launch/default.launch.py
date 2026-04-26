@@ -11,39 +11,61 @@ For venv-based setups, use venv.launch.py or source the helper first:
 
 import os
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import LifecycleNode
 from ament_index_python.packages import get_package_share_directory
 
 
-def generate_launch_description():
-    params = os.path.join(
-        get_package_share_directory('transformers_bridge'),
-        'config', 'rtdetrv2.yaml')
+def launch_setup(context, *args, **kwargs):
+    debug_val = LaunchConfiguration('debug').perform(context).lower()
+    params_file = LaunchConfiguration('params_file').perform(context)
 
-    debug_arg = DeclareLaunchArgument(
-        'debug',
-        default_value='False',
-        description='Enable debug image publishing with bounding boxes'
-    )
-    
-    debug_eval = PythonExpression(["'", LaunchConfiguration('debug'), "'.lower() == 'true'"])
+    # Base parameters from YAML
+    node_params = [params_file]
 
-    return LaunchDescription([
-        debug_arg,
+    # Only override debug if explicitly set to true or false
+    if debug_val == 'true':
+        node_params.append({'debug': True})
+    elif debug_val == 'false':
+        node_params.append({'debug': False})
+    # If 'none' (default), we don't append anything, so the YAML value wins.
+
+    return [
         LifecycleNode(
             package='transformers_bridge',
             namespace='transformers',
-            executable='detrv2',
+            executable='detector',
             name='transformers_node',
             output='both',
             emulate_tty=True,
-            parameters=[params, {'debug': debug_eval}],
+            parameters=node_params,
             remappings=[
                 ('/camera/image_raw', '/camera/image_raw'),
-                # ('detections', '/robot/detections'),
-                # ('debug_image', '/robot/debug_image'),
             ],
-        ),
+        )
+    ]
+
+
+def generate_launch_description():
+    params_path = os.path.join(
+        get_package_share_directory('transformers_bridge'),
+        'config', 'default.yaml')
+
+    params_file_arg = DeclareLaunchArgument(
+        'params_file',
+        default_value=params_path,
+        description='Path to the ROS 2 parameters file to use'
+    )
+
+    debug_arg = DeclareLaunchArgument(
+        'debug',
+        default_value='none',
+        description='Override debug parameter (true/false). If "none", uses value from params_file.'
+    )
+
+    return LaunchDescription([
+        params_file_arg,
+        debug_arg,
+        OpaqueFunction(function=launch_setup)
     ])

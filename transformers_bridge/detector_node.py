@@ -3,11 +3,13 @@ auto_inject_venv(packages=['torch', 'transformers'])
 # Now safe to import ML packages
 
 # ML imports
+import json
 import torch
 import cv2
 import numpy as np
 import threading
 import time
+from pathlib import Path
 from transformers import AutoImageProcessor, AutoModelForObjectDetection
 from transformers_bridge.model_registry import resolve_model_config
 
@@ -24,6 +26,14 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 
 class TransformersDetectorNode(LifecycleNode):
+    _TIER_COLOR = {
+        "frequent": (0, 220, 0),
+        "common":   (255, 200, 0),
+        "rare":     (255, 120, 0),
+    }
+    _TIER_BADGE = {"frequent": "F", "common": "C", "rare": "R"}
+    _FALLBACK_COLOR = (0, 200, 255)  # cyan — label not found in cat_meta
+
     def __init__(self):
         super().__init__("transformers_node")
 
@@ -34,12 +44,14 @@ class TransformersDetectorNode(LifecycleNode):
         self.declare_parameter("device",     "auto")  # auto/cpu/cuda
         self.declare_parameter("image_size", 640)     # resize before inference
         self.declare_parameter("compressed", False)   # subscribe to compressed image topics
+        self.declare_parameter("cat_meta_path", "")  # path to LVIS-style category metadata; enables adaptive draw when set
 
         # Model (loaded in on_configure)
         self._model = None
         self._processor = None
         self._bridge = CvBridge()
         self._image_size = None
+        self._label_freq: dict | None = None  # populated by cat_meta_path; None = simple draw
 
         # Pub/Sub
         self._pub_detections = None
@@ -80,6 +92,23 @@ class TransformersDetectorNode(LifecycleNode):
 
         self._image_size = self.get_parameter("image_size").value
         self.compressed  = self.get_parameter("compressed").value
+
+        cat_meta_path = self.get_parameter("cat_meta_path").value
+        if cat_meta_path:
+            try:
+                self._label_freq = self._load_label_freq(cat_meta_path)
+                self.get_logger().info(
+                    f"Adaptive draw enabled — loaded {len(self._label_freq)} categories "
+                    f"from '{cat_meta_path}'"
+                )
+            except Exception as e:
+                self.get_logger().warn(
+                    f"Could not load cat_meta_path '{cat_meta_path}': {e} "
+                    f"— falling back to simple draw"
+                )
+                self._label_freq = None
+        else:
+            self._label_freq = None
 
         # Resolve model config from registry
         # This allows us to use custom model names and automatically get the correct processor and model classes
@@ -260,10 +289,7 @@ class TransformersDetectorNode(LifecycleNode):
         else:
             self._fps_last_time = now
 
-        if isinstance(frame, CompressedImage):
-            cv_image = self._bridge.compressed_imgmsg_to_cv2(frame, "rgb8")
-        else:
-            cv_image = self._bridge.imgmsg_to_cv2(frame, "rgb8")
+        cv_image = self._to_rgb(frame)
 
         inputs = self._processor(
             images=cv_image, return_tensors="pt", size={"height": self._image_size, "width": self._image_size}).to(self._device)
@@ -278,20 +304,17 @@ class TransformersDetectorNode(LifecycleNode):
             threshold=self.threshold,
         )[0]
 
-        # Avoid publishing empty detections
-        if len(results["scores"]) == 0:
-            return
-
-        self._pub_detections.publish(self._to_detection_msg(results, frame.header))
-
-        self.get_logger().debug(f"scores: {results['scores']}, labels: {results['labels']}, boxes: {results['boxes']}")
-
-        # Debug annotation — zero cost when debug=False
         if self.debug:
             annotated = self._draw(cv_image.copy(), results)
             debug_msg = self._bridge.cv2_to_imgmsg(annotated, encoding="rgb8")
             debug_msg.header = frame.header
             self._pub_debug.publish(debug_msg)
+
+        if len(results["scores"]) == 0:
+            return
+
+        self._pub_detections.publish(self._to_detection_msg(results, frame.header))
+        self.get_logger().debug(f"scores: {results['scores']}, labels: {results['labels']}, boxes: {results['boxes']}")
 
     # ── Vision Msgs ───────────────────────────────────────────────────────────
     def _to_detection_msg(self, results, header) -> Detection2DArray:
@@ -320,16 +343,113 @@ class TransformersDetectorNode(LifecycleNode):
 
         return array_msg
 
+    @staticmethod
+    def _load_label_freq(path: str) -> dict:
+        """Return {label_name: frequency} from a LVIS-style category metadata file.
+
+        Handles three formats:
+        - LVIS official annotations JSON  {"categories": [{"name":..., "frequency":"r"|"c"|"f"}, ...]}
+        - EgoObjects cat_meta.json        {"1": {"name":..., "frequency":"rare"|"common"|"frequent"}, ...}
+        - Flat list                        [{"name":..., "frequency":...}, ...]
+        """
+        _NORM = {"r": "rare", "c": "common", "f": "frequent",
+                 "rare": "rare", "common": "common", "frequent": "frequent"}
+
+        raw = json.loads(Path(path).read_text())
+
+        if isinstance(raw, dict) and "categories" in raw:   # LVIS annotations JSON
+            entries = raw["categories"]
+        elif isinstance(raw, dict):                          # EgoObjects cat_meta.json
+            entries = list(raw.values())
+        elif isinstance(raw, list):                          # bare list
+            entries = raw
+        else:
+            raise ValueError(f"Unrecognised cat_meta format in '{path}'")
+
+        return {
+            e["name"]: _NORM.get(e["frequency"], e["frequency"])
+            for e in entries
+            if "name" in e and "frequency" in e
+        }
+
+    def _to_rgb(self, msg) -> np.ndarray:
+        """Convert any sensor_msgs Image or CompressedImage to an HxWx3 RGB uint8 array.
+
+        Handles encodings that cv_bridge refuses to auto-convert (e.g. 8UC3 from
+        KITTI/rosbag publishers that don't declare a color space).
+        """
+        if isinstance(msg, CompressedImage):
+            arr = self._bridge.compressed_imgmsg_to_cv2(msg, "passthrough")
+            # JPEG/PNG decompress to BGR by default in OpenCV
+            return cv2.cvtColor(arr, cv2.COLOR_BGR2RGB) if arr.ndim == 3 else cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
+
+        enc = msg.encoding.lower()
+        arr = self._bridge.imgmsg_to_cv2(msg, "passthrough")
+
+        if enc in ("rgb8", "rgb16"):
+            return arr if arr.dtype == np.uint8 else (arr >> 8).astype(np.uint8)
+        if enc in ("bgr8", "8uc3"):
+            return cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+        if enc in ("mono8", "8uc1"):
+            return cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
+        if enc == "mono16":
+            return cv2.cvtColor((arr >> 8).astype(np.uint8), cv2.COLOR_GRAY2RGB)
+        if enc == "rgba8":
+            return cv2.cvtColor(arr, cv2.COLOR_RGBA2RGB)
+        if enc == "bgra8":
+            return cv2.cvtColor(arr, cv2.COLOR_BGRA2RGB)
+
+        self.get_logger().warn(
+            f"Unknown image encoding '{msg.encoding}' — treating as BGR", throttle_duration_sec=10.0)
+        return cv2.cvtColor(arr, cv2.COLOR_BGR2RGB) if arr.ndim == 3 else cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
+
     def _draw(self, img: np.ndarray, result) -> np.ndarray:
-        """Draw bounding boxes onto img (RGB). Returns the annotated image."""
+        """Draw bounding boxes onto img (RGB). Returns the annotated image.
+
+        Simple mode (cat_meta_path not set): green box + label, unchanged behaviour.
+        Adaptive mode (cat_meta_path set): color by frequency tier, confidence-scaled
+        thickness, filled text background, and text scale adapted to image width.
+        Works with any LVIS-style dataset (LVIS, EgoObjects, …).
+        """
+        if self._label_freq is None:
+            for score, label_id, box in zip(
+                    result["scores"], result["labels"], result["boxes"]):
+                x1, y1, x2, y2 = [int(v) for v in box.tolist()]
+                label = f"{self._model.config.id2label[label_id.item()]} {score:.2f}"
+                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(img, label, (x1, max(y1 - 5, 0)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1,
+                            cv2.LINE_AA)
+            return img
+
+        # Adaptive mode
+        _, w = img.shape[:2]
+        text_scale = max(0.35, min(0.7, w / 1280))
+
         for score, label_id, box in zip(
                 result["scores"], result["labels"], result["boxes"]):
             x1, y1, x2, y2 = [int(v) for v in box.tolist()]
-            label = f"{self._model.config.id2label[label_id.item()]} {score:.2f}"
-            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(img, label, (x1, max(y1 - 5, 0)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1,
-                        cv2.LINE_AA)
+            name = self._model.config.id2label[label_id.item()]
+
+            freq  = self._label_freq.get(name)
+            color = self._TIER_COLOR.get(freq, self._FALLBACK_COLOR)
+            badge = self._TIER_BADGE.get(freq, "")
+            label = f"{name} [{badge}] {score:.2f}" if badge else f"{name} {score:.2f}"
+
+            thickness = max(1, round(score.item() * 3))
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+
+            (tw, th), baseline = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, text_scale, 1)
+            ty = max(y1 - 4, th + baseline)
+            cv2.rectangle(img,
+                          (x1, ty - th - baseline),
+                          (x1 + tw, ty + baseline),
+                          color, cv2.FILLED)
+            cv2.putText(img, label, (x1, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX, text_scale,
+                        (0, 0, 0), 1, cv2.LINE_AA)
+
         return img
 
 

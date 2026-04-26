@@ -29,7 +29,7 @@ The subscriber stores only the **latest frame** (no queue). The inference thread
 ```
 transformers_bridge/
 ├── config/
-│   └── rtdetrv2.yaml               # Default parameters
+│   └── default.yaml                # Default parameters
 ├── launch/
 │   ├── default.launch.py           # Start node; drive lifecycle manually
 │   └── fast.launch.py              # Start node + auto configure → activate
@@ -37,12 +37,14 @@ transformers_bridge/
 │   ├── benchmark.py                # Standalone latency/throughput benchmark
 │   └── venv_setup.py               # Venv auto-inject helper
 ├── transformers_bridge/
-│   ├── detrv2.py                   # Detector LifecycleNode
+│   ├── detector_node.py            # Detector LifecycleNode
 │   ├── model_registry.py           # Model factory + list_models entry point
 │   └── test_image_publisher.py     # Video → /camera/image_raw publisher (testing)
 ├── requirements.txt
 └── package.xml
 ```
+
+> Training scripts, dataset preparation, and fine-tuned checkpoints live in a separate repository and are not part of this package.
 
 ---
 
@@ -153,14 +155,15 @@ ros2 launch transformers_bridge fast.launch.py \
 
 ## Parameters
 
-| Parameter    | Default                   | Description                                                   |
-| ------------ | ------------------------- | ------------------------------------------------------------- |
-| `model_name` | `PekingU/rtdetr_v2_r18vd` | HuggingFace model ID or local path                            |
-| `threshold`  | `0.5`                     | Minimum confidence score for published detections             |
-| `debug`      | `false`                   | Publish annotated image on `debug_image`                      |
-| `device`     | `auto`                    | `auto` \| `cpu` \| `cuda` \| `cuda:N`                         |
-| `image_size` | `640`                     | Resize input to this square size before inference             |
-| `compressed` | `false`                   | Subscribe to `sensor_msgs/CompressedImage` instead of `Image` |
+| Parameter       | Default                   | Description                                                                                    |
+| --------------- | ------------------------- | ---------------------------------------------------------------------------------------------- |
+| `model_name`    | `PekingU/rtdetr_v2_r18vd` | HuggingFace model ID or local path                                                             |
+| `threshold`     | `0.5`                     | Minimum confidence score for published detections                                              |
+| `debug`         | `false`                   | Publish annotated image on `debug_image` (published every frame regardless of detections)      |
+| `device`        | `auto`                    | `auto` \| `cpu` \| `cuda` \| `cuda:N`                                                          |
+| `image_size`    | `640`                     | Resize input to this square size before inference                                              |
+| `compressed`    | `false`                   | Subscribe to `sensor_msgs/CompressedImage` instead of `Image`                                  |
+| `cat_meta_path` | `""`                      | Path to a LVIS-style category metadata JSON. Enables adaptive draw: tier-colored boxes, confidence-scaled thickness, filled text labels. Supports LVIS, EgoObjects, and flat-list formats. Leave empty for simple green-box draw. |
 
 Parameters are read once in `on_configure`. To change them, deactivate → cleanup → reconfigure the node.
 
@@ -307,6 +310,12 @@ The 0.5 s startup timer may be too short on slow machines. Increase it in `fast.
 ```python
 TimerAction(period=2.0, actions=[configure_event])
 ```
+
+### Camera topic shows no output / encoding error
+
+The node handles the most common raw image encodings automatically: `rgb8`, `bgr8`, `8UC3` (KITTI, many drivers), `mono8`, `mono16`, `rgba8`, `bgra8`. If your camera publishes an unsupported encoding, a throttled warning is logged and the frame is treated as BGR.
+
+For KITTI rosbags (which publish `8UC3`) no extra configuration is needed — just remap the topic as shown above.
 
 ### AV1 codec errors with `test_image_pub`
 

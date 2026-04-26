@@ -1,4 +1,4 @@
-# Parameters for the RTDETRv2 detector node.
+# Default parameters for the detector node.
 # Loaded by both default.launch.py and fast.launch.py.
 #
 # Key: fully-qualified node name (namespace + node name).

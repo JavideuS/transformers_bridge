@@ -1,2 +1,5 @@
 __pycache__
 *venv*
+*.jpg
+*.mp4
+SESSION_SUMMARY.md

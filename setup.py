@@ -15,11 +15,7 @@ setup(
             ['launch/default.launch.py', 'launch/fast.launch.py']),
         # Parameter files
         ('share/' + package_name + '/config',
-            ['config/rtdetrv2.yaml']),
-
-        # Install media files next to scripts so nodes can find them at runtime
-        ('lib/' + package_name, ['madison.jpg']),
-        ('lib/' + package_name, ['SukunaJogo_h264.mp4']),
+            ['config/default.yaml']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -34,7 +30,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'detrv2 = transformers_bridge.detrv2:main',
+            'detector = transformers_bridge.detector_node:main',
             'test_image_pub = transformers_bridge.test_image_publisher:main',
             'venv_setup = scripts.venv_setup:main',
             'list_models = transformers_bridge.model_registry:main',

@@ -1,5 +1,10 @@
 torch>=2.0.0
 torchvision>=0.15.0
 transformers[torch]>=4.40.0
+accelerate>=0.30.0
+datasets>=2.18.0
 pillow>=9.0.0
+tqdm>=4.60.0
+pycocotools>=2.0.6
 #numpy==1.26.4
+scipy
