@@ -1,17 +1,14 @@
-# Default parameters for the detector node.
-# Loaded by both default.launch.py and fast.launch.py.
-#
-# Key: fully-qualified node name (namespace + node name).
-# Override at launch time with:
-#   ros2 launch transformers_bridge fast.launch.py threshold:=0.7
+# Default parameters — RT-DETRv2 backend.
+# /**  matches any node name/namespace so this file works with all launch files.
+# Use with: ros2 launch transformers_bridge fast.launch.py params_file:=/path/to/this/file.yaml
 
-/transformers/transformers_node:
+/**:
   ros__parameters:
     backend: "transformers"
     model_name: "PekingU/rtdetr_v2_r18vd"
     threshold: 0.5
     debug: false
     compressed: false
-    device: "auto"   # auto | cpu | cuda
+    device: "auto"              # auto | cpu | cuda | cuda:N
     image_size: 640
-    camera_info_topic: ""   # set to e.g. "/camera/camera_info" to enable
+    camera_info_topic: ""       # e.g. /camera/camera_info

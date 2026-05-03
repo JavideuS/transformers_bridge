@@ -1,8 +1,8 @@
 # YOLO backend template.
-# Copy and fill in model_path before use.
+# /**  matches any node name/namespace so this file works with all launch files.
 # Use with: ros2 launch transformers_bridge fast.launch.py params_file:=/path/to/this/file.yaml
 
-/transformers/transformers_node:
+/**:
   ros__parameters:
     backend: "yolo"
     model_path: "yolov8s.pt"    # standard YOLOv8s (auto-downloaded) or path to custom .pt weights

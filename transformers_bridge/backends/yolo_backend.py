@@ -9,8 +9,19 @@ class YoloDetector(BaseDetector):
         self._threshold = 0.5
 
     def load(self, params: dict, logger) -> None:
+        from pathlib import Path
         from ultralytics import YOLO
+
+        weights_dir = Path.home() / ".cache" / "ultralytics"
+        weights_dir.mkdir(parents=True, exist_ok=True)
+
         model_path = params["model_path"]
+        # Resolve bare filenames to the cache dir so downloads land there
+        # instead of the CWD. Explicit paths (absolute or relative with //) are left as-is.
+        p = Path(model_path)
+        if p.name == str(p):   # no directory component
+            model_path = str(weights_dir / p)
+            logger.info(f"Resolved '{p}' → {model_path}")
         device = params["device"]
         self._iou_threshold = params.get("iou_threshold", 0.45)
         self._threshold = params.get("threshold", 0.5)

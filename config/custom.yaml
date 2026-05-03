@@ -1,8 +1,9 @@
 # Custom / fine-tuned model template.
+# /**  matches any node name/namespace so this file works with all launch files.
 # Covers all parameters for both backends. Fill in the fields you need.
 # Use with: ros2 launch transformers_bridge fast.launch.py params_file:=/path/to/this/file.yaml
 
-/transformers/transformers_node:
+/**:
   ros__parameters:
     # ── Backend selection ──────────────────────────────────────────────────
     backend: "transformers"       # transformers | yolo
