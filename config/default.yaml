@@ -7,9 +7,11 @@
 
 /transformers/transformers_node:
   ros__parameters:
+    backend: "transformers"
     model_name: "PekingU/rtdetr_v2_r18vd"
     threshold: 0.5
     debug: false
     compressed: false
-    device: "auto" # auto | cpu | cuda
-    image_size: 640 # resize shorter edge before inference (RT-DETR specific)
+    device: "auto"   # auto | cpu | cuda
+    image_size: 640
+    camera_info_topic: ""   # set to e.g. "/camera/camera_info" to enable

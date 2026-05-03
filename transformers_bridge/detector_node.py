@@ -1,202 +1,242 @@
-from scripts.venv_setup import auto_inject_venv
-auto_inject_venv(packages=['torch', 'transformers'])
-# Now safe to import ML packages
+"""
+DetectorNode — base lifecycle node for object detection in ROS2.
 
-# ML imports
+Designed to be subclassed. The inference pipeline is a template method with
+three override points for downstream packages (e.g. egocentric_ros):
+
+    _post_process(detections, cv_image, frame) -> list[dict]
+        Called after backend inference, before drawing and publishing.
+        Override to add 3D lifting, filtering, re-scoring, tracking IDs, etc.
+
+    _extra_publish(detections, cv_image, frame)
+        Called after the standard Detection2DArray is published.
+        Override to publish Detection3DArray, context tokens, depth maps, etc.
+
+    _draw(img, detections) -> np.ndarray
+        Override for custom visualization (e.g. overlay depth, track IDs).
+
+Subclass pattern (in egocentric_ros or any dependent package):
+
+    from transformers_bridge.detector_node import DetectorNode
+
+    class EgoDetectorNode(DetectorNode):
+        def on_configure(self, state):
+            result = super().on_configure(state)       # loads backend, warm-up
+            if result != TransitionCallbackReturn.SUCCESS:
+                return result
+            # load your depth model, read extra params, etc.
+            return TransitionCallbackReturn.SUCCESS
+
+        def on_activate(self, state):
+            result = super().on_activate(state)        # creates pubs/subs, starts thread
+            self._camera_info_sub = self.create_subscription(CameraInfo, ...)
+            self._pub_det3d = self.create_lifecycle_publisher(Detection3DArray, ...)
+            return result
+
+        def on_deactivate(self, state):
+            self.destroy_subscription(self._camera_info_sub)
+            self.destroy_lifecycle_publisher(self._pub_det3d)
+            return super().on_deactivate(state)        # stops thread, destroys base pubs
+
+        def _post_process(self, detections, cv_image, frame):
+            # lift 2D → 3D using self._camera_info
+            return detections
+
+        def _extra_publish(self, detections, cv_image, frame):
+            self._pub_det3d.publish(self._build_det3d(detections, frame))
+
+Backend selection is done via the 'backend' ROS2 parameter ("transformers" or "yolo").
+Switch at runtime: deactivate → cleanup → set new param → configure → activate.
+"""
+
 import json
-import torch
 import cv2
 import numpy as np
 import threading
 import time
 from pathlib import Path
-from transformers import AutoImageProcessor, AutoModelForObjectDetection
-from transformers_bridge.model_registry import resolve_model_config
 
-# ROS imports
 import rclpy
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn, State
 from rclpy.callback_groups import ReentrantCallbackGroup
-from sensor_msgs.msg import Image, CompressedImage
-from vision_msgs.msg import Detection2DArray, Detection2D, BoundingBox2D, ObjectHypothesisWithPose
+from sensor_msgs.msg import Image, CompressedImage, CameraInfo
+from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithPose
 from cv_bridge import CvBridge
-#Optimization
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
+_BACKEND_PACKAGES = {
+    "transformers": ["torch", "transformers"],
+    "yolo":         ["torch", "ultralytics"],
+}
 
 
-class TransformersDetectorNode(LifecycleNode):
+class DetectorNode(LifecycleNode):
+    """Base detection lifecycle node. Subclass to extend the pipeline."""
+
     _TIER_COLOR = {
-        "frequent": (0, 220, 0),
-        "common":   (255, 200, 0),
-        "rare":     (255, 120, 0),
+        "frequent": (0, 220, 0), #GREEN
+        "common":   (255, 200, 0), #YELLOW
+        "rare":     (255, 120, 0), #ORANGE
     }
-    _TIER_BADGE = {"frequent": "F", "common": "C", "rare": "R"}
-    _FALLBACK_COLOR = (0, 200, 255)  # cyan — label not found in cat_meta
+    _TIER_BADGE   = {"frequent": "F", "common": "C", "rare": "R"}
+    _FALLBACK_COLOR = (0, 200, 255)
 
-    def __init__(self):
-        super().__init__("transformers_node")
+    def __init__(self, node_name: str = "detector_node"):
+        super().__init__(node_name)
 
-        # Declare parameters
+        # ── Common parameters ────────────────────────────────────────────────
+        self.declare_parameter("backend",    "transformers")   # "transformers" | "yolo"
+        self.declare_parameter("threshold",  0.5)
+        self.declare_parameter("debug",      False)
+        self.declare_parameter("device",     "auto")           # auto | cpu | cuda
+        self.declare_parameter("image_size", 640)
+        self.declare_parameter("compressed", False)
+        self.declare_parameter("cat_meta_path",     "")        # LVIS-style freq metadata
+        self.declare_parameter("camera_info_topic", "")        # optional; enables self._camera_info
+
+        # ── Transformers-specific ────────────────────────────────────────────
         self.declare_parameter("model_name", "PekingU/rtdetr_v2_r18vd")
-        self.declare_parameter("threshold", 0.5)
-        self.declare_parameter("debug", False)  # toggle bounding-box annotation
-        self.declare_parameter("device",     "auto")  # auto/cpu/cuda
-        self.declare_parameter("image_size", 640)     # resize before inference
-        self.declare_parameter("compressed", False)   # subscribe to compressed image topics
-        self.declare_parameter("cat_meta_path", "")  # path to LVIS-style category metadata; enables adaptive draw when set
 
-        # Model (loaded in on_configure)
-        self._model = None
-        self._processor = None
-        self._bridge = CvBridge()
-        self._image_size = None
-        self._label_freq: dict | None = None  # populated by cat_meta_path; None = simple draw
+        # ── YOLO-specific ────────────────────────────────────────────────────
+        self.declare_parameter("model_path",       "yolov8s.pt")
+        self.declare_parameter("iou_threshold",    0.45)
+        self.declare_parameter("class_names_path", "")
 
-        # Pub/Sub
+        # ── State ────────────────────────────────────────────────────────────
+        self._backend       = None
+        self._camera_info   = None   # populated if camera_info_topic is set
+        self._label_freq    = None
+        self._bridge        = CvBridge()
+        self._image_size    = None
+
+        # ── Pub/sub placeholders ─────────────────────────────────────────────
         self._pub_detections = None
-        self._pub_debug = None
-        self._sub = None
-
+        self._pub_debug      = None
+        self._sub            = None
+        self._camera_info_sub = None
 
         self._camera_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT, # avoids reliable/best_effor compatibility issues
+            reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
-            depth=1  # only keep latest — Matches drop policy
+            depth=1,
         )
 
-        # Inference thread state
-        # _latest_frame: written atomically by _image_callback (CPython GIL),
-        # pinned to a local variable before use in _infer_loop.
-        self._latest_frame: Image | None = None
-        self._new_frame_event = threading.Event()   # signals a new frame is ready
-        self._running = False
-        self._infer_thread: threading.Thread | None = None
-
-        # FPS counting
-        self._frame_count = 0
+        # ── Inference thread ─────────────────────────────────────────────────
+        self._latest_frame  = None
+        self._new_frame_event = threading.Event()
+        self._running       = False
+        self._infer_thread  = None
+        self._frame_count   = 0
         self._fps_last_time = None
 
-    # ── Lifecycle callbacks ─────────────────────────────────────────────────
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def on_configure(self, state: State) -> TransitionCallbackReturn:
-        """Load model weights. Called once before activation."""
-        self.model_name = self.get_parameter("model_name").value
-        self.threshold  = self.get_parameter("threshold").value
-        self.debug      = self.get_parameter("debug").value
-        device_param = self.get_parameter("device").value
-        if device_param == "auto":
-            self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            self._device = torch.device(device_param)
+        """Load backend model. Subclasses: call super() first, check result."""
+        backend_name = self.get_parameter("backend").value
+        if backend_name not in _BACKEND_PACKAGES:
+            self.get_logger().error(
+                f"Unknown backend '{backend_name}'. Valid: {list(_BACKEND_PACKAGES)}"
+            )
+            return TransitionCallbackReturn.FAILURE
 
+        self.threshold   = self.get_parameter("threshold").value
+        self.debug       = self.get_parameter("debug").value
         self._image_size = self.get_parameter("image_size").value
         self.compressed  = self.get_parameter("compressed").value
+
+        device_param = self.get_parameter("device").value
+        from scripts.venv_setup import auto_inject_venv
+        auto_inject_venv(packages=_BACKEND_PACKAGES[backend_name])
+        import torch
+        self._device = (
+            torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            if device_param == "auto" else torch.device(device_param)
+        )
 
         cat_meta_path = self.get_parameter("cat_meta_path").value
         if cat_meta_path:
             try:
-                self._label_freq = self._load_label_freq(cat_meta_path)
+                self._label_freq = _load_label_freq(cat_meta_path)
                 self.get_logger().info(
-                    f"Adaptive draw enabled — loaded {len(self._label_freq)} categories "
-                    f"from '{cat_meta_path}'"
+                    f"Adaptive draw: {len(self._label_freq)} categories from '{cat_meta_path}'"
                 )
             except Exception as e:
-                self.get_logger().warn(
-                    f"Could not load cat_meta_path '{cat_meta_path}': {e} "
-                    f"— falling back to simple draw"
-                )
-                self._label_freq = None
+                self.get_logger().warn(f"cat_meta_path load failed: {e} — simple draw")
+
+        if backend_name == "transformers":
+            from transformers_bridge.backends.transformers_backend import TransformersDetector
+            self._backend = TransformersDetector()
         else:
-            self._label_freq = None
+            from transformers_bridge.backends.yolo_backend import YoloDetector
+            self._backend = YoloDetector()
 
-        # Resolve model config from registry
-        # This allows us to use custom model names and automatically get the correct processor and model classes
-        cfg, matched_key = resolve_model_config(self.model_name)
-
-        if matched_key is None:
-            self.get_logger().warn(
-                f"Model '{self.model_name}' did not match any registry entry — "
-                f"falling back to Auto classes. Results may vary."
-            )
-        elif not cfg.get("tested", False):
-            self.get_logger().warn(
-                f"Model type '{matched_key}' is in the registry but has not been "
-                f"tested end-to-end. Proceed with caution."
-            )
-
-        if cfg.get("notes"):
-            self.get_logger().info(f"Registry note for '{matched_key}': {cfg['notes']}")
-
-        for param in cfg.get("extra_params", []):
-            try:
-                self.declare_parameter(param, "")
-            except Exception:
-                pass  # already declared
-
-        processor_cls = cfg["processor_cls"]
-        model_cls = cfg["model_cls"]
-
-        self.get_logger().info(
-            f"Loading model '{self.model_name}' on {self._device} "
-            f"[{processor_cls.__name__} / {model_cls.__name__}] …"
-        )
-
+        params = {
+            "device":           self._device,
+            "threshold":        self.threshold,
+            "model_name":       self.get_parameter("model_name").value,
+            "model_path":       self.get_parameter("model_path").value,
+            "iou_threshold":    self.get_parameter("iou_threshold").value,
+            "class_names_path": self.get_parameter("class_names_path").value,
+        }
         try:
-            self._processor = processor_cls.from_pretrained(self.model_name)
-            self._model = model_cls.from_pretrained(self.model_name)
+            self._backend.load(params, self.get_logger())
         except Exception as e:
-            self.get_logger().error(f"Failed to load model '{self.model_name}': {e}")
+            self.get_logger().error(f"Backend load failed: {e}")
             return TransitionCallbackReturn.FAILURE
-        self._model.to(self._device).eval()
 
         self._callback_group = ReentrantCallbackGroup()
-
-        self._warm_up()
-
+        self.get_logger().info("Running warm-up …")
+        self._backend.warm_up(self._image_size)
         self.get_logger().info("Model loaded ✓")
         return TransitionCallbackReturn.SUCCESS
 
     def on_activate(self, state: State) -> TransitionCallbackReturn:
-        """Start inference thread, create publishers and subscription."""
-        # Relative names — remappable via --ros-args --remap or launch remappings=[]
+        """Create publishers and start inference thread.
+
+        Subclasses: call super() first, then add your publishers/subscribers.
+        """
         self._pub_detections = self.create_lifecycle_publisher(
             Detection2DArray, "detections", 10)
-
         if self.debug:
-            self._pub_debug = self.create_lifecycle_publisher(
-                Image, "debug_image", 10)
+            self._pub_debug = self.create_lifecycle_publisher(Image, "debug_image", 10)
 
-        # Subscription just stores the frame and wakes the inference thread
-        if self.compressed:
-            self._sub = self.create_subscription(
-                CompressedImage, "/camera/image_raw/compressed", self._image_callback, self._camera_qos,
-                callback_group=self._callback_group)
-        else:
-            self._sub = self.create_subscription(
-                Image, "/camera/image_raw", self._image_callback, self._camera_qos,
-                callback_group=self._callback_group)
+        topic    = "/camera/image_raw/compressed" if self.compressed else "/camera/image_raw"
+        msg_type = CompressedImage if self.compressed else Image
+        self._sub = self.create_subscription(
+            msg_type, topic, self._image_callback, self._camera_qos,
+            callback_group=self._callback_group,
+        )
 
-        # Inference thread: runs at maximum speed, blocked by Event when idle
+        camera_info_topic = self.get_parameter("camera_info_topic").value
+        if camera_info_topic:
+            self._camera_info_sub = self.create_subscription(
+                CameraInfo, camera_info_topic, self._camera_info_callback,
+                self._camera_qos, callback_group=self._callback_group,
+            )
+
         self._running = True
         self._infer_thread = threading.Thread(
             target=self._infer_loop, daemon=True, name="infer_loop")
         self._infer_thread.start()
 
-        self.get_logger().info(
-            f"Active — inference at max speed  (debug={self.debug})")
-
-        # Required: activates all lifecycle publishers managed by the base class
+        self.get_logger().info(f"Active — inference at max speed  (debug={self.debug})")
         return super().on_activate(state)
 
     def on_deactivate(self, state: State) -> TransitionCallbackReturn:
-        """Stop inference thread and clean up. Model stays in memory."""
-        # Signal the thread to exit, then unblock it if it's waiting
+        """Stop inference thread and destroy base publishers/subscribers.
+
+        Subclasses: destroy YOUR publishers/subscribers BEFORE calling super().
+        """
         self._running = False
         self._new_frame_event.set()
         if self._infer_thread is not None:
             self._infer_thread.join(timeout=2.0)
             self._infer_thread = None
+
+        if self._camera_info_sub is not None:
+            self.destroy_subscription(self._camera_info_sub)
+            self._camera_info_sub = None
 
         self.destroy_subscription(self._sub)
         self._sub = None
@@ -205,85 +245,57 @@ class TransformersDetectorNode(LifecycleNode):
 
         self.destroy_lifecycle_publisher(self._pub_detections)
         self._pub_detections = None
-
         if self._pub_debug is not None:
             self.destroy_lifecycle_publisher(self._pub_debug)
             self._pub_debug = None
 
-        # Required: deactivates lifecycle publishers managed by the base class
         return super().on_deactivate(state)
 
     def on_cleanup(self, state: State) -> TransitionCallbackReturn:
-        """Free GPU memory."""
-        del self._model, self._processor
-        torch.cuda.empty_cache()
-        self._model = self._processor = None
+        """Free backend GPU memory. Subclasses: call super() last."""
+        if self._backend is not None:
+            self._backend.unload()
+            self._backend = None
+        self._label_freq = None
+        self._camera_info = None
         self._image_size = None
-        self.get_logger().info("Model unloaded, GPU memory freed")
+        self.get_logger().info("Backend unloaded, GPU memory freed")
         return TransitionCallbackReturn.SUCCESS
 
     def on_shutdown(self, state: State) -> TransitionCallbackReturn:
-        """Called on ros2 shutdown regardless of current state."""
         self._running = False
         self._new_frame_event.set()
-        torch.cuda.empty_cache()
+        if self._backend is not None:
+            self._backend.unload()
         return TransitionCallbackReturn.SUCCESS
 
-    # ── Inference ───────────────────────────────────────────────────────────
-    def _forward(self, inputs):
-        """Run inference on the given inputs."""
+    # ── Inference pipeline (template method) ─────────────────────────────────
 
-        # Mixed precision (cuda optimization)
-        if self._device.type == "cuda":
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                return self._model(**inputs)
-        return self._model(**inputs)
-
-
-
-    def _warm_up(self, runs: int = 2) -> None:
-        """Run a few dummy forward passes so CUDA JIT kernels are compiled
-        before the first real frame arrives. Must mirror _infer_and_publish exactly."""
-        self.get_logger().info("Running warm-up …")
-        dummy = np.zeros((self._image_size, self._image_size, 3), dtype=np.uint8)
-        inputs = self._processor(images=dummy, return_tensors="pt").to(self._device)
-        with torch.inference_mode():
-            for _ in range(runs):
-                self._forward(inputs)
-        self.get_logger().info("Warm-up complete ✓")
-    
     def _image_callback(self, msg) -> None:
-        """Store the latest frame and wake the inference thread. Must stay fast."""
-        self._latest_frame = msg    # atomic in CPython (single STORE_ATTR)
-        self._new_frame_event.set() # unblock _infer_loop
+        self._latest_frame = msg
+        self._new_frame_event.set()
+
+    def _camera_info_callback(self, msg: CameraInfo) -> None:
+        self._camera_info = msg
 
     def _infer_loop(self) -> None:
-        """Inference thread: runs as fast as the model allows.
-        Blocks on Event when no new frame is available (no busy-waiting).
-        """
         while self._running:
-            # Block until _image_callback signals a new frame (or deactivate wakes us)
             got_frame = self._new_frame_event.wait(timeout=0.5)
             self._new_frame_event.clear()
-
             if not got_frame or not self._running:
                 continue
-
-            # Pin to local — safe even if _image_callback fires mid-inference
-            # and replaces self._latest_frame with a newer msg.
             frame = self._latest_frame
             if frame is None:
                 continue
-
             self._infer_and_publish(frame)
 
-    def _infer_and_publish(self, frame: Image) -> None:
+    def _infer_and_publish(self, frame) -> None:
         now = time.monotonic()
         if self._fps_last_time is not None:
             self._frame_count += 1
             if self._frame_count % 30 == 0:
-                fps = 30 / (now - self._fps_last_time)
-                self.get_logger().info(f"Inference FPS: {fps:.1f}")
+                self.get_logger().info(
+                    f"FPS: {30 / (now - self._fps_last_time):.1f}")
                 self._fps_last_time = now
                 self._frame_count = 0
         else:
@@ -291,101 +303,107 @@ class TransformersDetectorNode(LifecycleNode):
 
         cv_image = self._to_rgb(frame)
 
-        inputs = self._processor(
-            images=cv_image, return_tensors="pt", size={"height": self._image_size, "width": self._image_size}).to(self._device)
+        # 1. Backend inference → normalized list of dicts
+        detections = self._backend.infer(cv_image, self._image_size, self.threshold)
 
-        with torch.inference_mode():
-            outputs = self._forward(inputs)
+        # 2. Post-processing hook — override for 3D lifting, tracking, filtering
+        detections = self._post_process(detections, cv_image, frame)
 
-        results = self._processor.post_process_object_detection(
-            outputs,
-            target_sizes=torch.tensor(
-                [(cv_image.shape[0], cv_image.shape[1])], device=self._device),
-            threshold=self.threshold,
-        )[0]
-
-        if self.debug:
-            annotated = self._draw(cv_image.copy(), results)
-            debug_msg = self._bridge.cv2_to_imgmsg(annotated, encoding="rgb8")
+        # 3. Debug visualization
+        if self.debug and self._pub_debug is not None:
+            debug_msg = self._bridge.cv2_to_imgmsg(
+                self._draw(cv_image.copy(), detections), encoding="rgb8")
             debug_msg.header = frame.header
             self._pub_debug.publish(debug_msg)
 
-        if len(results["scores"]) == 0:
-            return
+        # 4. Standard Detection2DArray output
+        if detections:
+            self._pub_detections.publish(
+                self._to_detection_msg(detections, frame.header))
 
-        self._pub_detections.publish(self._to_detection_msg(results, frame.header))
-        self.get_logger().debug(f"scores: {results['scores']}, labels: {results['labels']}, boxes: {results['boxes']}")
+        # 5. Extra publish hook — override for Detection3DArray, context, etc.
+        self._extra_publish(detections, cv_image, frame)
 
-    # ── Vision Msgs ───────────────────────────────────────────────────────────
-    def _to_detection_msg(self, results, header) -> Detection2DArray:
-        array_msg = Detection2DArray()
-        array_msg.header = header
+        self.get_logger().debug(
+            f"detections: {len(detections)}  "
+            f"labels: {[d['label'] for d in detections]}"
+        )
 
-        for score, label_id, box in zip(
-                results["scores"], results["labels"], results["boxes"]):
+    # ── Extension hooks ───────────────────────────────────────────────────────
+
+    def _post_process(
+        self, detections: list[dict], cv_image: np.ndarray, frame
+    ) -> list[dict]:
+        """Override to add 3D lifting, tracking IDs, score filtering, etc.
+
+        self._camera_info is available here if camera_info_topic was set.
+        Returns the (modified) detections list.
+        """
+        return detections
+
+    def _extra_publish(
+        self, detections: list[dict], cv_image: np.ndarray, frame
+    ) -> None:
+        """Override to publish additional topics (Detection3DArray, context, depth)."""
+
+    def _draw(self, img: np.ndarray, detections: list[dict]) -> np.ndarray:
+        """Override for custom visualization (e.g. tracking IDs, depth overlay)."""
+        if self._label_freq is None:
+            for d in detections:
+                x1, y1, x2, y2 = [int(v) for v in d["box"]]
+                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(img, f"{d['label']} {d['score']:.2f}",
+                            (x1, max(y1 - 5, 0)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+            return img
+
+        _, w = img.shape[:2]
+        text_scale = max(0.35, min(0.7, w / 1280))
+        for d in detections:
+            x1, y1, x2, y2 = [int(v) for v in d["box"]]
+            freq  = self._label_freq.get(d["label"])
+            color = self._TIER_COLOR.get(freq, self._FALLBACK_COLOR)
+            badge = self._TIER_BADGE.get(freq, "")
+            label = (f"{d['label']} [{badge}] {d['score']:.2f}"
+                     if badge else f"{d['label']} {d['score']:.2f}")
+            thickness = max(1, round(d["score"] * 3))
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+            (tw, th), bl = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, text_scale, 1)
+            ty = max(y1 - 4, th + bl)
+            cv2.rectangle(img, (x1, ty - th - bl), (x1 + tw, ty + bl), color, cv2.FILLED)
+            cv2.putText(img, label, (x1, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX, text_scale, (0, 0, 0), 1, cv2.LINE_AA)
+        return img
+
+    # ── ROS message helpers ───────────────────────────────────────────────────
+
+    def _to_detection_msg(self, detections: list[dict], header) -> Detection2DArray:
+        msg = Detection2DArray()
+        msg.header = header
+        for d in detections:
+            x1, y1, x2, y2 = d["box"]
             det = Detection2D()
             det.header = header
-
-            # Bounding box center + size (Detection2D uses center format, not x1y1x2y2)
-            x1, y1, x2, y2 = box.tolist()
             det.bbox.center.position.x = (x1 + x2) / 2
             det.bbox.center.position.y = (y1 + y2) / 2
             det.bbox.size_x = float(x2 - x1)
             det.bbox.size_y = float(y2 - y1)
-
-            # Class + confidence
             hyp = ObjectHypothesisWithPose()
-            hyp.hypothesis.class_id = self._model.config.id2label[label_id.item()]
-            hyp.hypothesis.score = score.item()
+            hyp.hypothesis.class_id = d["label"]
+            hyp.hypothesis.score    = d["score"]
             det.results.append(hyp)
-
-            array_msg.detections.append(det)
-
-        return array_msg
-
-    @staticmethod
-    def _load_label_freq(path: str) -> dict:
-        """Return {label_name: frequency} from a LVIS-style category metadata file.
-
-        Handles three formats:
-        - LVIS official annotations JSON  {"categories": [{"name":..., "frequency":"r"|"c"|"f"}, ...]}
-        - EgoObjects cat_meta.json        {"1": {"name":..., "frequency":"rare"|"common"|"frequent"}, ...}
-        - Flat list                        [{"name":..., "frequency":...}, ...]
-        """
-        _NORM = {"r": "rare", "c": "common", "f": "frequent",
-                 "rare": "rare", "common": "common", "frequent": "frequent"}
-
-        raw = json.loads(Path(path).read_text())
-
-        if isinstance(raw, dict) and "categories" in raw:   # LVIS annotations JSON
-            entries = raw["categories"]
-        elif isinstance(raw, dict):                          # EgoObjects cat_meta.json
-            entries = list(raw.values())
-        elif isinstance(raw, list):                          # bare list
-            entries = raw
-        else:
-            raise ValueError(f"Unrecognised cat_meta format in '{path}'")
-
-        return {
-            e["name"]: _NORM.get(e["frequency"], e["frequency"])
-            for e in entries
-            if "name" in e and "frequency" in e
-        }
+            msg.detections.append(det)
+        return msg
 
     def _to_rgb(self, msg) -> np.ndarray:
-        """Convert any sensor_msgs Image or CompressedImage to an HxWx3 RGB uint8 array.
-
-        Handles encodings that cv_bridge refuses to auto-convert (e.g. 8UC3 from
-        KITTI/rosbag publishers that don't declare a color space).
-        """
         if isinstance(msg, CompressedImage):
             arr = self._bridge.compressed_imgmsg_to_cv2(msg, "passthrough")
-            # JPEG/PNG decompress to BGR by default in OpenCV
-            return cv2.cvtColor(arr, cv2.COLOR_BGR2RGB) if arr.ndim == 3 else cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
+            return (cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+                    if arr.ndim == 3 else cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB))
 
         enc = msg.encoding.lower()
         arr = self._bridge.imgmsg_to_cv2(msg, "passthrough")
-
         if enc in ("rgb8", "rgb16"):
             return arr if arr.dtype == np.uint8 else (arr >> 8).astype(np.uint8)
         if enc in ("bgr8", "8uc3"):
@@ -398,67 +416,39 @@ class TransformersDetectorNode(LifecycleNode):
             return cv2.cvtColor(arr, cv2.COLOR_RGBA2RGB)
         if enc == "bgra8":
             return cv2.cvtColor(arr, cv2.COLOR_BGRA2RGB)
-
         self.get_logger().warn(
-            f"Unknown image encoding '{msg.encoding}' — treating as BGR", throttle_duration_sec=10.0)
-        return cv2.cvtColor(arr, cv2.COLOR_BGR2RGB) if arr.ndim == 3 else cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
-
-    def _draw(self, img: np.ndarray, result) -> np.ndarray:
-        """Draw bounding boxes onto img (RGB). Returns the annotated image.
-
-        Simple mode (cat_meta_path not set): green box + label, unchanged behaviour.
-        Adaptive mode (cat_meta_path set): color by frequency tier, confidence-scaled
-        thickness, filled text background, and text scale adapted to image width.
-        Works with any LVIS-style dataset (LVIS, EgoObjects, …).
-        """
-        if self._label_freq is None:
-            for score, label_id, box in zip(
-                    result["scores"], result["labels"], result["boxes"]):
-                x1, y1, x2, y2 = [int(v) for v in box.tolist()]
-                label = f"{self._model.config.id2label[label_id.item()]} {score:.2f}"
-                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(img, label, (x1, max(y1 - 5, 0)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1,
-                            cv2.LINE_AA)
-            return img
-
-        # Adaptive mode
-        _, w = img.shape[:2]
-        text_scale = max(0.35, min(0.7, w / 1280))
-
-        for score, label_id, box in zip(
-                result["scores"], result["labels"], result["boxes"]):
-            x1, y1, x2, y2 = [int(v) for v in box.tolist()]
-            name = self._model.config.id2label[label_id.item()]
-
-            freq  = self._label_freq.get(name)
-            color = self._TIER_COLOR.get(freq, self._FALLBACK_COLOR)
-            badge = self._TIER_BADGE.get(freq, "")
-            label = f"{name} [{badge}] {score:.2f}" if badge else f"{name} {score:.2f}"
-
-            thickness = max(1, round(score.item() * 3))
-            cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
-
-            (tw, th), baseline = cv2.getTextSize(
-                label, cv2.FONT_HERSHEY_SIMPLEX, text_scale, 1)
-            ty = max(y1 - 4, th + baseline)
-            cv2.rectangle(img,
-                          (x1, ty - th - baseline),
-                          (x1 + tw, ty + baseline),
-                          color, cv2.FILLED)
-            cv2.putText(img, label, (x1, ty),
-                        cv2.FONT_HERSHEY_SIMPLEX, text_scale,
-                        (0, 0, 0), 1, cv2.LINE_AA)
-
-        return img
+            f"Unknown encoding '{msg.encoding}' — treating as BGR",
+            throttle_duration_sec=10.0)
+        return (cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+                if arr.ndim == 3 else cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB))
 
 
-# ── Entry point ─────────────────────────────────────────────────────────────
+# ── Module-level helpers ──────────────────────────────────────────────────────
+
+def _load_label_freq(path: str) -> dict:
+    _NORM = {"r": "rare", "c": "common", "f": "frequent",
+             "rare": "rare", "common": "common", "frequent": "frequent"}
+    raw = json.loads(Path(path).read_text())
+    if isinstance(raw, dict) and "categories" in raw:
+        entries = raw["categories"]
+    elif isinstance(raw, dict):
+        entries = list(raw.values())
+    elif isinstance(raw, list):
+        entries = raw
+    else:
+        raise ValueError(f"Unrecognised cat_meta format in '{path}'")
+    return {
+        e["name"]: _NORM.get(e["frequency"], e["frequency"])
+        for e in entries
+        if "name" in e and "frequency" in e
+    }
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main(args=None):
     rclpy.init(args=args)
-    node = TransformersDetectorNode()
-    # Need to make the node reentrant to handle the inference thread
+    node = DetectorNode()
     executor = rclpy.executors.MultiThreadedExecutor()
     executor.add_node(node)
     try:
@@ -466,32 +456,3 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
-
-# ── Stand-alone test (no ROS) ────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    from PIL import Image as PILImage
-
-    image = PILImage.open("madison.jpg")
-
-    image_processor = AutoImageProcessor.from_pretrained("PekingU/rtdetr_v2_r18vd")
-    model = AutoModelForObjectDetection.from_pretrained("PekingU/rtdetr_v2_r18vd")
-    model.eval()
-
-    inputs = image_processor(images=image, return_tensors="pt")
-
-    with torch.inference_mode():
-        outputs = model(**inputs)
-
-    results = image_processor.post_process_object_detection(
-        outputs,
-        target_sizes=torch.tensor([(image.height, image.width)]),
-        threshold=0.5,
-    )
-
-    for result in results:
-        for score, label_id, box in zip(
-                result["scores"], result["labels"], result["boxes"]):
-            box = [round(v, 2) for v in box.tolist()]
-            print(f"{model.config.id2label[label_id.item()]}: "
-                  f"{result['scores'][0].item():.2f}  {box}")

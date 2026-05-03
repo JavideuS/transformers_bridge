@@ -4,9 +4,10 @@ Drive lifecycle manually after launching:
   ros2 lifecycle set /transformers/transformers_node configure
   ros2 lifecycle set /transformers/transformers_node activate
 
-For venv-based setups, use venv.launch.py or source the helper first:
-  source <(ros2 run transformers_bridge venv_setup)
+Usage:
   ros2 launch transformers_bridge default.launch.py
+  ros2 launch transformers_bridge default.launch.py params_file:=/path/to/yolo_ego.yaml
+  ros2 launch transformers_bridge default.launch.py debug:=true
 """
 
 import os
@@ -18,18 +19,10 @@ from ament_index_python.packages import get_package_share_directory
 
 
 def launch_setup(context, *args, **kwargs):
-    debug_val = LaunchConfiguration('debug').perform(context).lower()
-    params_file = LaunchConfiguration('params_file').perform(context)
-
-    # Base parameters from YAML
-    node_params = [params_file]
-
-    # Only override debug if explicitly set to true or false
-    if debug_val == 'true':
-        node_params.append({'debug': True})
-    elif debug_val == 'false':
-        node_params.append({'debug': False})
-    # If 'none' (default), we don't append anything, so the YAML value wins.
+    params = [LaunchConfiguration('params_file').perform(context)]
+    debug  = LaunchConfiguration('debug').perform(context).lower()
+    if debug in ('true', 'false'):
+        params.append({'debug': debug == 'true'})
 
     return [
         LifecycleNode(
@@ -39,10 +32,8 @@ def launch_setup(context, *args, **kwargs):
             name='transformers_node',
             output='both',
             emulate_tty=True,
-            parameters=node_params,
-            remappings=[
-                ('/camera/image_raw', '/camera/image_raw'),
-            ],
+            parameters=params,
+            remappings=[('/camera/image_raw', '/phone/image')],
         )
     ]
 
@@ -52,20 +43,14 @@ def generate_launch_description():
         get_package_share_directory('transformers_bridge'),
         'config', 'default.yaml')
 
-    params_file_arg = DeclareLaunchArgument(
-        'params_file',
-        default_value=params_path,
-        description='Path to the ROS 2 parameters file to use'
-    )
-
-    debug_arg = DeclareLaunchArgument(
-        'debug',
-        default_value='none',
-        description='Override debug parameter (true/false). If "none", uses value from params_file.'
-    )
-
     return LaunchDescription([
-        params_file_arg,
-        debug_arg,
-        OpaqueFunction(function=launch_setup)
+        DeclareLaunchArgument(
+            'params_file', default_value=params_path,
+            description='Path to the ROS2 parameters YAML file.',
+        ),
+        DeclareLaunchArgument(
+            'debug', default_value='',
+            description='Override debug flag (true/false). Empty = use YAML value.',
+        ),
+        OpaqueFunction(function=launch_setup),
     ])

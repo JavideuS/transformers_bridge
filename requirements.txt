@@ -6,5 +6,9 @@ datasets>=2.18.0
 pillow>=9.0.0
 tqdm>=4.60.0
 pycocotools>=2.0.6
-#numpy==1.26.4
+numpy>=1.23.0,<2.0.0
 scipy
+# YOLO — opencv-python pinned <4.9 to stay compatible with numpy<2 (cv_bridge constraint)
+ultralytics
+ultralytics-thop>=2.0.18
+opencv-python-headless>=4.6.0,<4.9.0

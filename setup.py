@@ -12,10 +12,11 @@ setup(
         ('share/' + package_name, ['package.xml']),
         # Launch files
         ('share/' + package_name + '/launch',
-            ['launch/default.launch.py', 'launch/fast.launch.py']),
+            ['launch/default.launch.py', 'launch/fast.launch.py',
+             'launch/compare.launch.py']),
         # Parameter files
         ('share/' + package_name + '/config',
-            ['config/default.yaml']),
+            ['config/default.yaml', 'config/yolo.yaml', 'config/custom.yaml']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

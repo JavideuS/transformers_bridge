@@ -1,0 +1,17 @@
+# YOLO backend template.
+# Copy and fill in model_path before use.
+# Use with: ros2 launch transformers_bridge fast.launch.py params_file:=/path/to/this/file.yaml
+
+/transformers/transformers_node:
+  ros__parameters:
+    backend: "yolo"
+    model_path: "yolov8s.pt"    # standard YOLOv8s (auto-downloaded) or path to custom .pt weights
+    class_names_path: ""        # YOLO-World only: path to id2label.json or dataset.yaml
+    iou_threshold: 0.45
+    threshold: 0.5
+    debug: false
+    compressed: false
+    device: "auto"              # auto | cpu | cuda | cuda:N
+    image_size: 640
+    cat_meta_path: ""           # LVIS-style category metadata for tier-colored draw
+    camera_info_topic: ""       # e.g. /camera/camera_info

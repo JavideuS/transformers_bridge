@@ -3,3 +3,5 @@ __pycache__
 *.jpg
 *.mp4
 SESSION_SUMMARY.md
+config/yolo_ego.yaml
+config/yolo_baseline.yaml

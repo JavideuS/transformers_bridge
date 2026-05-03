@@ -1,0 +1,29 @@
+# Custom / fine-tuned model template.
+# Covers all parameters for both backends. Fill in the fields you need.
+# Use with: ros2 launch transformers_bridge fast.launch.py params_file:=/path/to/this/file.yaml
+
+/transformers/transformers_node:
+  ros__parameters:
+    # ── Backend selection ──────────────────────────────────────────────────
+    backend: "transformers"       # transformers | yolo
+
+    # ── Transformers backend ───────────────────────────────────────────────
+    model_name: ""                # HuggingFace model ID or local checkpoint path
+
+    # ── YOLO backend ──────────────────────────────────────────────────────
+    model_path: "yolov8s.pt"      # path to .pt weights (standard YOLO or YOLO-World)
+    class_names_path: ""          # YOLO-World only: path to id2label.json or dataset.yaml
+    iou_threshold: 0.45
+
+    # ── Common inference ───────────────────────────────────────────────────
+    threshold: 0.5                # minimum confidence score to publish
+    image_size: 640               # square resize before inference
+    device: "auto"                # auto | cpu | cuda | cuda:N
+
+    # ── Input ──────────────────────────────────────────────────────────────
+    compressed: false             # subscribe to CompressedImage instead of Image
+    camera_info_topic: ""         # e.g. /camera/camera_info  (for subclass 3D lifting)
+
+    # ── Visualization ──────────────────────────────────────────────────────
+    debug: false                  # publish annotated image on debug_image
+    cat_meta_path: ""             # LVIS-style category metadata for tier-colored draw
