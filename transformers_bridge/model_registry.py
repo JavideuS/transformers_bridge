@@ -55,45 +55,40 @@ from pathlib import Path
 def resolve_model_config(model_name: str) -> tuple[dict, str | None]:
     """Return (config, matched_key).
 
-    Iterates registry keys and returns the first whose key is a substring of
-    model_name.lower(). 
-    
-    If model_name is a directory, it checks config.json for the architecture
-    before falling back.
+    For local directories: reads config.json first (authoritative), then falls
+    back to substring match on the path.  For HuggingFace IDs (no local dir):
+    substring match only.
     """
-    lower = model_name.lower()
-    
-    # 1. Standard substring match
-    for key, cfg in REGISTRY.items():
-        if key in lower:
-            return cfg, key
-            
-    # 2. Local directory check
     model_path = Path(model_name)
+
+    # 1. Local checkpoint — read config.json before guessing from the path name
     if model_path.is_dir():
         config_file = model_path / "config.json"
         if config_file.exists():
             try:
-                with open(config_file, 'r') as f:
+                with open(config_file) as f:
                     config_data = json.load(f)
-                
-                # Check architectures field
-                architectures = config_data.get("architectures", [])
-                for arch in architectures:
+                # architectures field is the most reliable signal
+                for arch in config_data.get("architectures", []):
                     arch_lower = arch.lower()
                     for key, cfg in REGISTRY.items():
                         if key in arch_lower:
                             return cfg, key
-                            
-                # Check model_type field as fallback
+                # model_type as secondary fallback
                 model_type = config_data.get("model_type", "").lower()
                 if model_type:
                     for key, cfg in REGISTRY.items():
                         if key in model_type:
                             return cfg, key
             except Exception:
-                pass # Fallback to default if anything goes wrong
-                
+                pass
+
+    # 2. Substring match on model name / HuggingFace ID
+    lower = model_name.lower()
+    for key, cfg in REGISTRY.items():
+        if key in lower:
+            return cfg, key
+
     return _FALLBACK, None
 
 
